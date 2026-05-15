@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"myuia/adb"
-	"myuia/assets"
+	"github.com/yyszone/gua/adb"
+	"github.com/yyszone/gua/assets"
 )
 
 // 设备端路径常量

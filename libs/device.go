@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"myuia/adb"
-	"myuia/services"
+	"github.com/yyszone/gua/adb"
+	"github.com/yyszone/gua/services"
 )
 
 // ---------- Device：核心设备客户端 ----------

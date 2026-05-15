@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 	"sync"   
-	"myuia/adb"
+	"github.com/yyszone/gua/adb"
 )
 
 // ---------- 外部接口和类型定义 ----------
