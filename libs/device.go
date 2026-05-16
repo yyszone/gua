@@ -459,10 +459,51 @@ func (d *Device) WindowSize() (int, int, error) {
 
 // ---------- 基础操作 ----------
 
-// Click 点击屏幕坐标
-func (d *Device) Click(x, y int) error {
+// Click 点击屏幕坐标。支持绝对像素(>=1)和相对比例(<1)
+// libs/device.go
+
+// Click 支持逻辑像素(>1)和比例(<1)
+func (d *Device) GetPhysicalSize() (int, int, error) {
+	// 执行 wm size 命令获取物理尺寸
+	res, err := d.Shell("wm", "size")
+	if err != nil {
+		return 0, 0, err
+	}
+	// 输出格式通常为: "Physical size: 1080x2400"
+	var w, h int
+	_, err = fmt.Sscanf(strings.TrimSpace(res.Output), "Physical size: %dx%d", &w, &h)
+	if err != nil {
+		// 某些系统可能输出 "Override size: ..."
+		_, err = fmt.Sscanf(strings.TrimSpace(res.Output), "Override size: %dx%d", &w, &h)
+	}
+	
+	if w == 0 || h == 0 {
+		return 0, 0, fmt.Errorf("无法解析物理分辨率: %s", res.Output)
+	}
+	return w, h, nil
+}
+
+// Click 修改版：支持比例和物理像素，且完全准确
+func (d *Device) Click(x, y float64) error {
 	d.operationDelay("click")
-	_, err := d.jsonrpc.Call("click", []interface{}{x, y})
+
+	targetX, targetY := x, y
+
+	// 👉 如果是比例坐标，或者你想强制使用物理坐标系还原
+	if x < 1.0 && y < 1.0 {
+		// 关键：这里不能用 WindowSize，要用物理宽高
+		pw, ph, err := d.GetPhysicalSize()
+		if err == nil {
+			targetX = x * float64(pw)
+			targetY = y * float64(ph)
+			// log.Printf("[Click] 物理还原: (%f, %f) * (%d, %d) = (%d, %d)", x, y, pw, ph, int(targetX), int(targetY))
+		}
+	}
+
+	// 👉 核心：使用 FastClick (adb shell input tap)
+	// 因为 input tap 接收的是物理坐标系，和截图完全匹配
+	err := d.FastClick(int(targetX), int(targetY))
+	
 	d.operationDelayAfter("click")
 	return err
 }
@@ -483,7 +524,7 @@ func (d *Device) DoubleClick(x, y int, duration float64) error {
 	}
 	time.Sleep(time.Duration(duration * float64(time.Second)))
 	// 第二次点击
-	return d.Click(x, y)
+	return d.Click(float64(x), float64(y)) 
 }
 
 // LongClick 长按屏幕坐标

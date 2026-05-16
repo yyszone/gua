@@ -251,7 +251,7 @@ func (u *UiObject) ClickWithOffset(xoff, yoff float64, timeout ...float64) error
 	if err != nil {
 		return err
 	}
-	return u.device.Click(x, y)
+	return u.device.Click(float64(x), float64(y)) 
 }
 
 // ClickExists 如果元素存在则点击，返回是否成功
