@@ -299,9 +299,9 @@ func (d *Device) waitReady(timeout time.Duration) error {
 func (d *Device) jsonrpcCall(method string, params interface{}, timeout float64) (json.RawMessage, error) {
     ctx := context.Background()
 
-    t0 := time.Now()
+    // t0 := time.Now()
     result, err := JsonRpcCall(ctx, d.dev, d.serverPort, method, params, timeout, d.debug)
-    log.Printf("[RPC] %s 耗时=%v err=%v", method, time.Since(t0), err)
+    // log.Printf("[RPC] %s 耗时=%v err=%v", method, time.Since(t0), err)
 
     if err != nil {
         var uaErr *UiAutomationNotConnectedError
