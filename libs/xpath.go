@@ -5,6 +5,7 @@ import (
     "strconv"
     "strings"
     "github.com/antchfx/xmlquery"
+    "encoding/json" 
 )
 
 // FindByXPath 通过标准 XPath 语法查找元素
@@ -117,4 +118,55 @@ func (e *XPathElement) Enabled() bool {
 func (e *XPathElement) Index() int {
     v, _ := strconv.Atoi(e.Attr("index"))
     return v
+}
+
+// 获取所有信息
+func (e *XPathElement) AllAttrs() map[string]string {
+	m := make(map[string]string)
+	// e.node 是 xmlquery.Node，它有一个 Attr 切片存储了所有属性
+	for _, attr := range e.node.Attr {
+		m[attr.Name.Local] = attr.Value
+	}
+	return m
+}
+
+// ToMap 获取所有属性，并尝试将数值和布尔值转换为正确类型
+func (e *XPathElement) ToMap() map[string]interface{} {
+	m := make(map[string]interface{})
+	for _, attr := range e.node.Attr {
+		key := attr.Name.Local
+		val := attr.Value
+
+		// 尝试转换布尔值
+		if val == "true" {
+			m[key] = true
+			continue
+		}
+		if val == "false" {
+			m[key] = false
+			continue
+		}
+
+		// 尝试转换整数 (例如 index, bounds 中的数字等)
+		// 注意：bounds 类似 [0,0][100,100] 不会被转成数字，保持字符串
+		if i, err := strconv.Atoi(val); err == nil {
+			m[key] = i
+			continue
+		}
+
+		// 默认作为字符串
+		m[key] = val
+	}
+	return m
+}
+
+// ToJSON 返回格式化后的正规 JSON 字符串
+func (e *XPathElement) ToJSON() string {
+	data := e.ToMap()
+	// 使用 MarshalIndent 带有缩进，方便阅读
+	b, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
