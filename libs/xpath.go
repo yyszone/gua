@@ -120,18 +120,9 @@ func (e *XPathElement) Index() int {
     return v
 }
 
-// 获取所有信息
-func (e *XPathElement) AllAttrs() map[string]string {
-	m := make(map[string]string)
-	// e.node 是 xmlquery.Node，它有一个 Attr 切片存储了所有属性
-	for _, attr := range e.node.Attr {
-		m[attr.Name.Local] = attr.Value
-	}
-	return m
-}
 
 // ToMap 获取所有属性，并尝试将数值和布尔值转换为正确类型
-func (e *XPathElement) ToMap() map[string]interface{} {
+func (e *XPathElement) Info() map[string]interface{} {
 	m := make(map[string]interface{})
 	for _, attr := range e.node.Attr {
 		key := attr.Name.Local
@@ -162,7 +153,7 @@ func (e *XPathElement) ToMap() map[string]interface{} {
 
 // ToJSON 返回格式化后的正规 JSON 字符串
 func (e *XPathElement) ToJSON() string {
-	data := e.ToMap()
+	data := e.Info()
 	// 使用 MarshalIndent 带有缩进，方便阅读
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
