@@ -63,7 +63,7 @@ func main() {
 		fmt.Printf("👆 准备点击目标: [%s] (坐标: X=%d, Y=%d)\n", targetRegion.Text, int(targetRegion.CenterX), int(targetRegion.CenterY))
 
 		// 因为设置了 XYPercentage: false，所以这里 centerX 和 centerY 都是实际像素点
-		err = d.Click(int(targetRegion.CenterX), int(targetRegion.CenterY))
+		err = d.Click(targetRegion.CenterX, targetRegion.CenterY)
 		if err != nil {
 			fmt.Printf("点击失败: %v\n", err)
 		} else {
