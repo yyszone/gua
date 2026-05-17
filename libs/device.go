@@ -863,27 +863,48 @@ type P = map[string]interface{}
 // activity: Activity 名称（可选）
 // stop: 是否先停止应用
 func (d *Device) AppStart(packageName string, activity string, stop bool) error {
+	// 1. 👉 启动前预检：使用 pm path 判断包是否存在
+	// 这是 Android 最底层的命令，比 AppCurrent 快且稳
+	resPath, err := d.Shell("pm", "path", packageName)
+	if err != nil || !strings.Contains(resPath.Output, "package:") {
+		return fmt.Errorf("设备未安装应用: %s", packageName)
+	}
+
 	if stop {
 		d.AppStop(packageName)
 	}
 
+	var res *ShellResponse
 	if activity == "" {
-		// 使用 monkey 命令启动
-		_, err := d.Shell("monkey", "-p", packageName, "-c",
+		// 使用 monkey 命令启动，并接住输出结果
+		res, err = d.Shell("monkey", "-p", packageName, "-c",
 			"android.intent.category.LAUNCHER", "1")
-		return err
+	} else {
+		args := []string{
+			"am", "start",
+			"-a", "android.intent.action.MAIN",
+			"-c", "android.intent.category.LAUNCHER",
+			"-n", fmt.Sprintf("%s/%s", packageName, activity),
+		}
+		res, err = d.Shell(args...)
 	}
 
-	args := []string{
-		"am", "start",
-		"-a", "android.intent.action.MAIN",
-		"-c", "android.intent.category.LAUNCHER",
-		"-n", fmt.Sprintf("%s/%s", packageName, activity),
+	// 2. 👉 处理 ADB 连接层面的错误
+	if err != nil {
+		return err 
 	}
-	_, err := d.Shell(args...)
-	return err
+
+	// 3. 👉 关键：解析 Shell 命令的打印输出
+	// 即使命令退出码是 0，如果输出包含以下关键字，也代表启动失败
+	output := res.Output
+	if strings.Contains(output, "Error") || 
+	   strings.Contains(output, "does not exist") || 
+	   strings.Contains(output, "monkey aborted") {
+		return fmt.Errorf("启动失败详情: %s", strings.TrimSpace(output))
+	}
+
+	return nil
 }
-
 // AppStop 停止应用
 func (d *Device) AppStop(packageName string) error {
 	_, err := d.Shell("am", "force-stop", packageName)
