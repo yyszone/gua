@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-
+	"regexp"
 	"github.com/yyszone/gua/adb"
 	"github.com/yyszone/gua/services"
 )
@@ -927,66 +927,67 @@ func (d *Device) AppUninstall(packageName string) (bool, error) {
 }
 
 // AppCurrent 获取当前前台应用信息
-func (d *Device) AppCurrent() (map[string]string, error) {
-	resp, err := d.Shell("dumpsys", "activity", "activities")
-	if err != nil {
-		return nil, err
-	}
+var reActivityComponent = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9_.]+)/([\.a-zA-Z][a-zA-Z0-9_./\$]+)`)
 
-	result := make(map[string]string)
-	lines := strings.Split(resp.Output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		// 解析 mResumedActivity 或 mFocusedActivity
-		if strings.Contains(line, "mResumedActivity") || strings.Contains(line, "mFocusedActivity") {
-			// 格式: mResumedActivity: ActivityRecord{...  pkg/activity ...}
-			parts := strings.Fields(line)
-			for _, p := range parts {
-				if strings.Contains(p, "/") && !strings.HasPrefix(p, "{") {
-					comp := strings.TrimSuffix(p, "}")
-					slash := strings.Index(comp, "/")
-					if slash > 0 {
-						result["package"] = comp[:slash]
-						result["activity"] = comp[slash+1:]
-						return result, nil
-					}
-				}
-			}
-		}
-	}
-
-	return result, &DeviceError{Message: "无法获取前台应用信息"}
+func (d *Device) AppCurrent() (string, error) {
+    candidates := [][]string{
+        {"dumpsys", "activity", "activities", "|", "grep", "topResumedActivity"},
+        {"dumpsys", "activity", "activities", "|", "grep", "mResumedActivity"},
+        {"dumpsys", "window", "windows", "|", "grep", "mCurrentFocus"},
+        {"dumpsys", "window", "windows", "|", "grep", "mFocusedApp"},
+    }
+    for _, args := range candidates {
+        resp, err := d.Shell(args...)
+        if err != nil {
+            continue
+        }
+        line := strings.TrimSpace(strings.SplitN(resp.Output, "\n", 2)[0])
+        if line == "" {
+            continue
+        }
+        if m := reActivityComponent.FindStringSubmatch(line); m != nil {
+            return m[1], nil
+        }
+    }
+    // 全量兜底（不依赖 grep，最兼容）
+    resp, err := d.Shell("dumpsys", "activity", "activities")
+    if err == nil {
+        for _, line := range strings.Split(resp.Output, "\n") {
+            line = strings.TrimSpace(line)
+            if strings.Contains(line, "ActivityRecord") {
+                if m := reActivityComponent.FindStringSubmatch(line); m != nil {
+                    return m[1], nil
+                }
+            }
+        }
+    }
+    return "", &DeviceError{Message: "无法获取前台应用信息"}
 }
 
-// AppWait 等待应用启动
-// timeout: 超时时间（秒）
-// front: 是否等待到前台
-// 返回应用的 PID，0 表示未启动
 func (d *Device) AppWait(packageName string, timeout float64, front bool) (int, error) {
-	if timeout <= 0 {
-		timeout = 20.0
-	}
-	deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
-	for time.Now().Before(deadline) {
-		if front {
-			current, err := d.AppCurrent()
-			if err == nil && current["package"] == packageName {
-				pid := d.pidOfApp(packageName)
-				if pid > 0 {
-					return pid, nil
-				}
-			}
-		} else {
-			pid := d.pidOfApp(packageName)
-			if pid > 0 {
-				return pid, nil
-			}
-		}
-		time.Sleep(1 * time.Second)
-	}
-	return 0, nil
+    if timeout <= 0 {
+        timeout = 20.0
+    }
+    deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
+    for time.Now().Before(deadline) {
+        if front {
+            pkg, err := d.AppCurrent()
+            if err == nil && pkg == packageName {
+                pid := d.pidOfApp(packageName)
+                if pid > 0 {
+                    return pid, nil
+                }
+            }
+        } else {
+            pid := d.pidOfApp(packageName)
+            if pid > 0 {
+                return pid, nil
+            }
+        }
+        time.Sleep(1 * time.Second)
+    }
+    return 0, nil
 }
-
 // pidOfApp 获取应用的进程 ID
 func (d *Device) pidOfApp(packageName string) int {
 	resp, err := d.Shell("ps", "-A")
