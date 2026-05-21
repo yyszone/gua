@@ -54,18 +54,21 @@ func hashImgData(data []byte) uint64 {
 
 // optsKey 把 OCROptions 里影响识别结果的字段序列化成字符串，作为缓存 key 的一部分
 func optsKey(o OCROptions) string {
-	return fmt.Sprintf("%s|%d|%s|%d|%d|%d|%v|%s",
+	// 👉 【优化】：将 o.Config 纳入缓存特征计算，确保修改命令行参数时能立即刷新缓存
+	return fmt.Sprintf("%s|%d|%s|%d|%d|%d|%v|%s|%s",
 		o.Lang, o.PSM, o.SearchText,
 		o.BinarizeNum, o.HorizontalGapThreshold, o.VerticalGapThreshold,
-		o.XYPercentage, o.TextPadding)
+		o.XYPercentage, o.TextPadding, o.Config)
 }
 
 // ─── 公开类型定义（不变）──────────────────────────────────────────────────────
 
 // OCROptions 定义 OCR 识别选项
 type OCROptions struct {
+	ImageBytes             []byte // 新增：如果传入了图片字节，则直接识别该图片，不再调用截图
 	Lang                   string // 识别语言，默认 "chi_sim"
 	PSM                    int    // 页面分割模式，默认 3
+	Config                 string // 👉 【新增】：支持传入自定义参数，例如 "--psm 6" 或 "-c tessedit_char_whitelist=0-9"
 	SearchText             string // 搜索过滤文本，为空则不过滤
 	BinarizeNum            int    // 二值化阈值 (0-255)，<=0 表示不进行二值化，通常填 210
 	HorizontalGapThreshold int    // 水平连通间隙阈值(像素)，默认 30
@@ -73,7 +76,6 @@ type OCROptions struct {
 	XYPercentage           bool   // 是否返回百分比坐标 (0-1.0)，默认 false，返回绝对像素坐标
 	TextPadding            string // 合并文本时的填充字符
 }
-
 // OCRRegion 识别出的每个连通文本区域信息
 type OCRRegion struct {
 	Text     string  `json:"text"`
@@ -106,6 +108,9 @@ type internalWord struct {
 // OCR 对设备截图执行 OCR 识别。
 // 若截图与上次完全一致（FNV hash 相同）且缓存未过期，直接返回缓存结果，
 // 不调用 tesseract，节省 CPU 和时间。
+// OCR 对设备截图执行 OCR 识别。
+// 若截图与上次完全一致（FNV hash 相同）且缓存未过期，直接返回缓存结果，
+// 不调用 tesseract，节省 CPU 和时间。
 func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	// 填默认值
 	if opts.Lang == "" {
@@ -121,16 +126,24 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 		opts.VerticalGapThreshold = 10
 	}
 
-	// ── 1. 截图 ──
-	imgData, err := d.Screenshot()
-	if err != nil {
-		return nil, fmt.Errorf("获取截图失败: %w", err)
+	// ── 1. 获取图片（优先使用传入的 ImageBytes） ──
+	var imgData []byte
+	var err error
+	if len(opts.ImageBytes) > 0 {
+		// 传入了图片，直接用
+		imgData = opts.ImageBytes
+	} else {
+		// 没有传入图片，走全屏截图
+		imgData, err = d.Screenshot()
+		if err != nil {
+			return nil, fmt.Errorf("获取截图失败: %w", err)
+		}
 	}
 
 	// ── 2. 计算 hash，命中缓存则直接返回 ──
 	imgHash := hashImgData(imgData)
 	ok := optsKey(opts)
-
+    
 	deviceOCRCachesMu.Lock()
 	entry := deviceOCRCaches[d.serial]
 	deviceOCRCachesMu.Unlock()
@@ -144,8 +157,6 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	}
 
 	// ── 3. 二值化（可选） ──
-	// 注意：BinarizeImage 内部自己解码图片，不会二次解码 imgData 原始数据，
-	//       调用后 imgData 指向新的二值化 PNG 字节。
 	processedData := imgData
 	if opts.BinarizeNum > 0 && opts.BinarizeNum <= 255 {
 		processedData, err = binarizeImage(imgData, uint8(opts.BinarizeNum))
@@ -154,7 +165,7 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 		}
 	}
 
-	// ── 4. 解码一次，同时取宽高（不再 DecodeConfig + Decode 双重解码） ──
+	// ── 4. 解码一次，同时取宽高 ──
 	srcImg, _, err := image.Decode(bytes.NewReader(processedData))
 	if err != nil {
 		return nil, fmt.Errorf("解码图片失败: %w", err)
@@ -162,27 +173,54 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	imgW := float64(srcImg.Bounds().Dx())
 	imgH := float64(srcImg.Bounds().Dy())
 
-	// 把解码后的图片重新编为 PNG 供 tesseract 读取（避免重复持有原始字节）
+	// 把解码后的图片重新编为 PNG 供 tesseract 读取
 	var pngBuf bytes.Buffer
 	if err := png.Encode(&pngBuf, srcImg); err != nil {
 		return nil, fmt.Errorf("PNG 重编码失败: %w", err)
 	}
 	srcImg = nil // 允许 GC 回收解码后的像素内存
 
-	// ── 5. 调用 tesseract（通过 stdin 管道，无需临时文件）──
+	// ── 5. 动态装配 tesseract 命令参数 ──
 	ocrMutex.Lock()
 	defer ocrMutex.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// tesseract 支持 "stdin" 作为输入文件名，从 stdin 读图
-	cmd := exec.CommandContext(ctx, "tesseract", "stdin", "stdout",
-		"-l", opts.Lang,
-		"--psm", strconv.Itoa(opts.PSM),
-		"tsv",
-	)
-	cmd.Stdin = &pngBuf // 管道传图，省掉磁盘 IO
+	// 默认基础参数
+	args := []string{"stdin", "stdout", "-l", opts.Lang}
+
+	// 解析可能传入的自定义配置字符串 (如 "--psm 6" 或 "-c tessedit_char_whitelist=0-9")
+	var configArgs []string
+	if opts.Config != "" {
+		configArgs = strings.Fields(opts.Config)
+	}
+
+	// 安全保护：检测自定义配置中是否已包含 --psm 参数
+	hasCustomPSM := false
+	for _, arg := range configArgs {
+		if arg == "--psm" {
+			hasCustomPSM = true
+			break
+		}
+	}
+
+	// 如果自定义配置里没有指定 --psm，才追加默认的 opts.PSM，防止参数冲突导致运行报错
+	if !hasCustomPSM {
+		args = append(args, "--psm", strconv.Itoa(opts.PSM))
+	}
+
+	// 追加自定义参数
+	if len(configArgs) > 0 {
+		args = append(args, configArgs...)
+	}
+
+	// 指定输出格式为 tsv
+	args = append(args, "tsv")
+
+	// 管道传图运行
+	cmd := exec.CommandContext(ctx, "tesseract", args...)
+	cmd.Stdin = &pngBuf
 
 	var outBuf bytes.Buffer
 	cmd.Stdout = &outBuf
@@ -192,7 +230,7 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 			return nil, fmt.Errorf("未检测到 tesseract：\n%s\n原始错误: %v",
 				tesseractInstallHint(), err)
 		}
-		return nil, fmt.Errorf("tesseract 执行失败（检查语言包是否安装）: %w", err)
+		return nil, fmt.Errorf("tesseract 执行失败（参数错误或缺少语言包）: %w", err)
 	}
 
 	// ── 6. 解析 TSV ──
@@ -213,6 +251,7 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 
 	return result, nil
 }
+
 
 // InvalidateOCRCache 主动清除指定设备的 OCR 缓存（点击/操作后如需立即重识别，调用此函数）
 func (d *Device) InvalidateOCRCache() {
@@ -484,3 +523,4 @@ chi_sim.traineddata 放到 $(brew --prefix)/share/tessdata`
 		return "请根据平台安装 tesseract 并确保在 PATH 中"
 	}
 }
+
