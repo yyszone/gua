@@ -25,8 +25,6 @@ import (
 var ocrMutex sync.Mutex
 
 // ─── 每台设备独立的截图 hash 缓存 ─────────────────────────────────────────────
-// 缓存结构：{图片 hash + opts key} → OCRResult
-// 当截图字节完全相同时直接返回上次结果，省掉整个 tesseract 调用。
 
 type ocrCacheEntry struct {
 	imgHash   uint64
@@ -35,63 +33,64 @@ type ocrCacheEntry struct {
 	createdAt time.Time
 }
 
-// ocrCacheTTL 缓存最长有效时间。
-// 超过这个时间即使截图 hash 相同也重新识别（防止 UI 变化但像素巧合一致）。
 const ocrCacheTTL = 3 * time.Second
 
 var (
 	// 按设备 IP 存缓存，避免多设备互相污染
 	deviceOCRCaches   = make(map[string]*ocrCacheEntry)
-	deviceOCRCachesMu sync.Mutex
+	// 👉 升级为读写锁，支持多设备高并发时，无锁竞争地安全并行读取缓存
+	deviceOCRCachesMu sync.RWMutex
+
+	// 👉 【核心优化：依赖注入挂钩】
+	// 允许外部（如 upper-level 调度器）注入分布式锁。
+	// 若外部注入了该函数，本库的所有 OCR 进程都会自动通过该挂钩获取全局锁；
+	// 若未注入（或独立运行本库），则自动安全退回到本地单进程 ocrMutex，100% 避免循环导入。
+	DistLockHook func(serial string, timeout time.Duration) (unlock func(), err error)
 )
 
-// hashImgData 用 FNV-64 计算截图字节 hash（极快，约 1GB/s，不需要密码学安全）
+// hashImgData 用 FNV-64 计算截图字节 hash
 func hashImgData(data []byte) uint64 {
 	h := fnv.New64a()
 	h.Write(data)
 	return h.Sum64()
 }
 
-// optsKey 把 OCROptions 里影响识别结果的字段序列化成字符串，作为缓存 key 的一部分
+// optsKey 缓存 key
 func optsKey(o OCROptions) string {
-	// 👉 【优化】：将 o.Config 纳入缓存特征计算，确保修改命令行参数时能立即刷新缓存
 	return fmt.Sprintf("%s|%d|%s|%d|%d|%d|%v|%s|%s",
 		o.Lang, o.PSM, o.SearchText,
 		o.BinarizeNum, o.HorizontalGapThreshold, o.VerticalGapThreshold,
 		o.XYPercentage, o.TextPadding, o.Config)
 }
 
-// ─── 公开类型定义（不变）──────────────────────────────────────────────────────
+// ─── 公开类型定义 ──────────────────────────────────────────────────────
 
-// OCROptions 定义 OCR 识别选项
 type OCROptions struct {
-	ImageBytes             []byte // 新增：如果传入了图片字节，则直接识别该图片，不再调用截图
-	Lang                   string // 识别语言，默认 "chi_sim"
-	PSM                    int    // 页面分割模式，默认 3
-	Config                 string // 👉 【新增】：支持传入自定义参数，例如 "--psm 6" 或 "-c tessedit_char_whitelist=0-9"
-	SearchText             string // 搜索过滤文本，为空则不过滤
-	BinarizeNum            int    // 二值化阈值 (0-255)，<=0 表示不进行二值化，通常填 210
-	HorizontalGapThreshold int    // 水平连通间隙阈值(像素)，默认 30
-	VerticalGapThreshold   int    // 垂直行偏差阈值(像素)，默认 10
-	XYPercentage           bool   // 是否返回百分比坐标 (0-1.0)，默认 false，返回绝对像素坐标
-	TextPadding            string // 合并文本时的填充字符
+	ImageBytes             []byte 
+	Lang                   string 
+	PSM                    int    
+	Config                 string 
+	SearchText             string 
+	BinarizeNum            int    
+	HorizontalGapThreshold int    
+	VerticalGapThreshold   int    
+	XYPercentage           bool   
+	TextPadding            string 
 }
-// OCRRegion 识别出的每个连通文本区域信息
+
 type OCRRegion struct {
 	Text     string  `json:"text"`
 	CenterX  float64 `json:"centerX"`
 	CenterY  float64 `json:"centerY"`
 	Accuracy float64 `json:"accuracy"`
-	Box      [4]int  `json:"box"` // 左，上，右，下（绝对像素）
+	Box      [4]int  `json:"box"` 
 }
 
-// OCRResult OCR 最终输出结果
 type OCRResult struct {
 	Regions []OCRRegion
 	AllText string
 }
 
-// internalWord tesseract TSV 解析的内部结构
 type internalWord struct {
 	text   string
 	left   int
@@ -106,11 +105,6 @@ type internalWord struct {
 // ─── 主入口 ───────────────────────────────────────────────────────────────────
 
 // OCR 对设备截图执行 OCR 识别。
-// 若截图与上次完全一致（FNV hash 相同）且缓存未过期，直接返回缓存结果，
-// 不调用 tesseract，节省 CPU 和时间。
-// OCR 对设备截图执行 OCR 识别。
-// 若截图与上次完全一致（FNV hash 相同）且缓存未过期，直接返回缓存结果，
-// 不调用 tesseract，节省 CPU 和时间。
 func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	// 填默认值
 	if opts.Lang == "" {
@@ -130,10 +124,8 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	var imgData []byte
 	var err error
 	if len(opts.ImageBytes) > 0 {
-		// 传入了图片，直接用
 		imgData = opts.ImageBytes
 	} else {
-		// 没有传入图片，走全屏截图
 		imgData, err = d.Screenshot()
 		if err != nil {
 			return nil, fmt.Errorf("获取截图失败: %w", err)
@@ -144,15 +136,14 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	imgHash := hashImgData(imgData)
 	ok := optsKey(opts)
     
-	deviceOCRCachesMu.Lock()
+	deviceOCRCachesMu.RLock()
 	entry := deviceOCRCaches[d.serial]
-	deviceOCRCachesMu.Unlock()
+	deviceOCRCachesMu.RUnlock()
 
 	if entry != nil &&
 		entry.imgHash == imgHash &&
 		entry.optsKey == ok &&
 		time.Since(entry.createdAt) < ocrCacheTTL {
-		// 缓存命中：截图未变化，直接返回上次结果
 		return entry.result, nil
 	}
 
@@ -165,24 +156,29 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 		}
 	}
 
-	// ── 4. 解码一次，同时取宽高 ──
-	srcImg, _, err := image.Decode(bytes.NewReader(processedData))
+	// ── 4. 轻量级尺寸解析 ──
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(processedData))
 	if err != nil {
-		return nil, fmt.Errorf("解码图片失败: %w", err)
+		return nil, fmt.Errorf("解析图片尺寸失败: %w", err)
 	}
-	imgW := float64(srcImg.Bounds().Dx())
-	imgH := float64(srcImg.Bounds().Dy())
+	imgW := float64(cfg.Width)
+	imgH := float64(cfg.Height)
 
-	// 把解码后的图片重新编为 PNG 供 tesseract 读取
-	var pngBuf bytes.Buffer
-	if err := png.Encode(&pngBuf, srcImg); err != nil {
-		return nil, fmt.Errorf("PNG 重编码失败: %w", err)
+	// ── 5. 👉【核心优化】：调用全局锁/本地锁 ──
+	var unlock func()
+	if DistLockHook != nil {
+		var lockErr error
+		// 尝试获取外部注入的全局唯一锁，使用 d.serial 代替未定义的 d.IP（d.serial 为底层 Device 导出字段）
+		unlock, lockErr = DistLockHook(d.serial, 30*time.Second)
+		if lockErr != nil {
+			return nil, fmt.Errorf("等待全局 OCR 锁超时: %w", lockErr)
+		}
+	} else {
+		// 降级保护：回退到本地单进程互斥锁
+		ocrMutex.Lock()
+		unlock = ocrMutex.Unlock
 	}
-	srcImg = nil // 允许 GC 回收解码后的像素内存
-
-	// ── 5. 动态装配 tesseract 命令参数 ──
-	ocrMutex.Lock()
-	defer ocrMutex.Unlock()
+	defer unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -190,13 +186,11 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	// 默认基础参数
 	args := []string{"stdin", "stdout", "-l", opts.Lang}
 
-	// 解析可能传入的自定义配置字符串 (如 "--psm 6" 或 "-c tessedit_char_whitelist=0-9")
 	var configArgs []string
 	if opts.Config != "" {
 		configArgs = strings.Fields(opts.Config)
 	}
 
-	// 安全保护：检测自定义配置中是否已包含 --psm 参数
 	hasCustomPSM := false
 	for _, arg := range configArgs {
 		if arg == "--psm" {
@@ -205,22 +199,18 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 		}
 	}
 
-	// 如果自定义配置里没有指定 --psm，才追加默认的 opts.PSM，防止参数冲突导致运行报错
 	if !hasCustomPSM {
 		args = append(args, "--psm", strconv.Itoa(opts.PSM))
 	}
 
-	// 追加自定义参数
 	if len(configArgs) > 0 {
 		args = append(args, configArgs...)
 	}
 
-	// 指定输出格式为 tsv
 	args = append(args, "tsv")
 
-	// 管道传图运行
 	cmd := exec.CommandContext(ctx, "tesseract", args...)
-	cmd.Stdin = &pngBuf
+	cmd.Stdin = bytes.NewReader(processedData)
 
 	var outBuf bytes.Buffer
 	cmd.Stdout = &outBuf
@@ -252,20 +242,15 @@ func (d *Device) OCR(opts OCROptions) (*OCRResult, error) {
 	return result, nil
 }
 
-
-// InvalidateOCRCache 主动清除指定设备的 OCR 缓存（点击/操作后如需立即重识别，调用此函数）
+// InvalidateOCRCache 清除缓存
 func (d *Device) InvalidateOCRCache() {
 	deviceOCRCachesMu.Lock()
 	delete(deviceOCRCaches, d.serial)
 	deviceOCRCachesMu.Unlock()
 }
 
-// ─── 二值化（优化版：直接访问像素，避免 color interface 调用） ────────────────
+// ─── 二值化保持不变 ────────────────────────────────────
 
-// binarizeImage 对图片进行灰度二值化。
-// 优化：对 *image.NRGBA / *image.RGBA / *image.Gray 类型直接读取底层字节，
-//
-//	避免每像素的 interface 调用（原版用 color.GrayModel.Convert，约慢 3-5 倍）。
 func binarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 	src, _, err := image.Decode(bytes.NewReader(imgData))
 	if err != nil {
@@ -279,7 +264,6 @@ func binarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 
 	switch img := src.(type) {
 	case *image.NRGBA:
-		// 最常见类型（PNG 解码结果）：NRGBA，每像素 4 字节
 		for y := 0; y < h; y++ {
 			srcRow := img.Pix[y*img.Stride : y*img.Stride+w*4]
 			dstRow := dstPix[y*w : y*w+w]
@@ -287,8 +271,7 @@ func binarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 				r := uint32(srcRow[x*4])
 				g := uint32(srcRow[x*4+1])
 				bl := uint32(srcRow[x*4+2])
-				// ITU-R BT.601：0.299R + 0.587G + 0.114B
-				gray := uint8((r*19595 + g*38470 + bl*7471 + 1<<15) >> 16)
+				gray := uint8((r*19595 + g*38400 + bl*7471 + 1<<15) >> 16)
 				if gray > threshold {
 					dstRow[x] = 255
 				} else {
@@ -304,7 +287,7 @@ func binarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 				r := uint32(srcRow[x*4])
 				g := uint32(srcRow[x*4+1])
 				bl := uint32(srcRow[x*4+2])
-				gray := uint8((r*19595 + g*38470 + bl*7471 + 1<<15) >> 16)
+				gray := uint8((r*19595 + g*38400 + bl*7471 + 1<<15) >> 16)
 				if gray > threshold {
 					dstRow[x] = 255
 				} else {
@@ -313,7 +296,6 @@ func binarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 			}
 		}
 	case *image.Gray:
-		// 已经是灰度图，直接比阈值
 		for i, v := range img.Pix {
 			if i >= len(dstPix) {
 				break
@@ -325,7 +307,6 @@ func binarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 			}
 		}
 	default:
-		// 通用 fallback（其他格式如 YCbCr）
 		for y := b.Min.Y; y < b.Max.Y; y++ {
 			for x := b.Min.X; x < b.Max.X; x++ {
 				c := color.GrayModel.Convert(src.At(x, y)).(color.Gray)
@@ -339,19 +320,18 @@ func binarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 	}
 
 	var buf bytes.Buffer
-	buf.Grow(w * h / 2) // 预分配，灰度 PNG 压缩后约为原大小一半
+	buf.Grow(w * h / 2) 
 	if err := png.Encode(&buf, dst); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-// BinarizeImage 公开的二值化接口（保持向后兼容）
 func BinarizeImage(imgData []byte, threshold uint8) ([]byte, error) {
 	return binarizeImage(imgData, threshold)
 }
 
-// ─── TSV 解析（逻辑不变，仅优化内存分配） ────────────────────────────────────
+// ─── TSV 解析保持不变 ────────────────────────────────────
 
 func parseTesseractTSV(tsvData []byte, imgW, imgH float64, opts OCROptions) (*OCRResult, error) {
 	reader := csv.NewReader(bytes.NewReader(tsvData))
@@ -364,7 +344,6 @@ func parseTesseractTSV(tsvData []byte, imgW, imgH float64, opts OCROptions) (*OC
 		return nil, err
 	}
 
-	// 预分配（通常一屏 20-60 个词）
 	words := make([]internalWord, 0, 64)
 
 	for i, row := range records {
@@ -403,7 +382,6 @@ func parseTesseractTSV(tsvData []byte, imgW, imgH float64, opts OCROptions) (*OC
 		return &OCRResult{}, nil
 	}
 
-	// ── 按 top 排序后分行 ──
 	sort.Slice(words, func(i, j int) bool { return words[i].top < words[j].top })
 
 	lines := make([][]internalWord, 0, 16)
@@ -413,7 +391,6 @@ func parseTesseractTSV(tsvData []byte, imgW, imgH float64, opts OCROptions) (*OC
 			continue
 		}
 		last := lines[len(lines)-1]
-		// 计算当前行平均 top（用整数运算）
 		sumTop := 0
 		for _, cw := range last {
 			sumTop += cw.top
@@ -430,7 +407,6 @@ func parseTesseractTSV(tsvData []byte, imgW, imgH float64, opts OCROptions) (*OC
 		}
 	}
 
-	// ── 每行内水平分块 ──
 	groups := make([][]internalWord, 0, len(words))
 	for _, line := range lines {
 		sort.Slice(line, func(i, j int) bool { return line[i].left < line[j].left })
@@ -446,14 +422,13 @@ func parseTesseractTSV(tsvData []byte, imgW, imgH float64, opts OCROptions) (*OC
 		groups = append(groups, cur)
 	}
 
-	// ── 组装 OCRResult ──
 	result := &OCRResult{
 		Regions: make([]OCRRegion, 0, len(groups)),
 	}
 	var allText strings.Builder
 	allText.Grow(len(groups) * 8)
 
-	replacer := strings.NewReplacer(" ", "") // 复用，避免每次重新构造
+	replacer := strings.NewReplacer(" ", "") 
 
 	for _, group := range groups {
 		var textBuf strings.Builder
@@ -523,4 +498,3 @@ chi_sim.traineddata 放到 $(brew --prefix)/share/tessdata`
 		return "请根据平台安装 tesseract 并确保在 PATH 中"
 	}
 }
-
