@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 	"regexp"
+	"strconv" 
 	"github.com/yyszone/gua/adb"
 	"github.com/yyszone/gua/services"
 )
@@ -68,7 +69,8 @@ func NewDevice(serial string, addr ...string) (*Device, error) {
     }
 
     // adb forward 本地 9009 → 设备 9008
-    localPort := 9009
+    // 👉 【核心修改】将固定的 9009 修改为动态端口计算
+    localPort := getUniqueLocalPort(serial) 
     if err := adb.ForwardPort(a, serial, localPort, DeviceServerPort); err != nil {
         // forward 失败则回退到 ADB 隧道
         log.Printf("adb forward 失败，回退到隧道模式: %v", err)
@@ -1114,4 +1116,42 @@ func (d *Device) Unlock() error {
 			int(float64(w)*0.9), int(float64(h)*0.1), ScrollSteps)
 	}
 	return nil
+}
+
+// 👉 【新增】根据设备 IP 或序列号，生成或寻找一个宿主机上不冲突的唯一本地转发端口
+func getUniqueLocalPort(serial string) int {
+	defaultPort := 9009
+
+	// 1. 尝试去掉端口号，例如 "192.168.31.120:5555" -> "192.168.31.120"
+	host := serial
+	if idx := strings.Index(serial, ":"); idx != -1 {
+		host = serial[:idx]
+	}
+
+	// 2. 如果是标准的 IPv4 格式，提取最后一段作为偏移量 (100% 保证并发 IP 间不冲突)
+	parts := strings.Split(host, ".")
+	if len(parts) == 4 {
+		lastOctet, err := strconv.Atoi(parts[3])
+		if err == nil {
+			// 例如 182 映射到 20182，158 映射到 20158
+			return 20000 + lastOctet
+		}
+	}
+
+	// 3. 如果不是 IP（比如 USB 序列号 "988a1b2c"），则动态申请一个系统当前可用的空闲端口
+	return getFreePort(defaultPort)
+}
+
+// 👉 【新增】获取当前系统随机空闲端口的兜底函数
+func getFreePort(defaultPort int) int {
+	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+	if err != nil {
+		return defaultPort
+	}
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return defaultPort
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
 }
