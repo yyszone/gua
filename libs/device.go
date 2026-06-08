@@ -221,17 +221,22 @@ func (d *Device) ResetUiautomator() error {
 }
 
 // checkAlive 通过 /ping 端点检查 UIAutomator2 服务是否存活
+// 💡 升级为深度活性探针：同时利用 deviceInfo 检测 UiAutomation 状态，防止只通 HTTP 但 UiAutomation 已死的僵尸服务蒙混过关
 func (d *Device) checkAlive() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	resp, err := HttpRequest(ctx, d.dev, d.serverPort, "GET", "/ping", nil, 5.0, false)
-	if err != nil {
+	// 1. 快速检查 HTTP 通信层
+	resp, err := HttpRequest(ctx, d.dev, d.serverPort, "GET", "/ping", nil, 3.0, false)
+	if err != nil || string(resp.Content) != "pong" {
 		return false
 	}
-	return string(resp.Content) == "pong"
-}
 
+	// 2. 深度检查 UiAutomation 实际可用性 (调用最轻量的 deviceInfo JSON-RPC)
+	// 直接使用底层的 JsonRpcCall 绕过任何上层重试逻辑，防止产生死循环
+	_, err = JsonRpcCall(ctx, d.dev, d.serverPort, "deviceInfo", nil, 3.0, false)
+	return err == nil
+}
 // launchAndWait 启动 UIAutomator2 进程并等待就绪
 func (d *Device) launchAndWait() error {
 	// 通过 ADB shell 启动 UIAutomator2
