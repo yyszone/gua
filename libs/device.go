@@ -98,6 +98,7 @@ func NewDevice(serial string, addr ...string) (*Device, error) {
     return d, nil
 }
 
+
 // newDeviceWithTunnel 回退方案：使用 ADB 隧道
 func newDeviceWithTunnel(a, serial string) (*Device, error) {
     dev := &AdbTunnelDevice{AdbAddr: a, Serial: serial}
