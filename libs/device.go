@@ -497,21 +497,36 @@ func (d *Device) Click(x, y float64) error {
 
 	targetX, targetY := x, y
 
-	// 👉 如果是比例坐标，或者你想强制使用物理坐标系还原
+	// 👉 如果是比例坐标 (0.0 ~ 1.0)
 	if x < 1.0 && y < 1.0 {
-		// 关键：这里不能用 WindowSize，要用物理宽高
-		pw, ph, err := d.GetPhysicalSize()
-		if err == nil {
+		// 1. 🌟 通过 WindowSize() 动态判断当前屏幕是【横屏】还是【竖屏】
+		w, h, errWin := d.WindowSize()
+		isLandscape := false
+		if errWin == nil && w > h {
+			isLandscape = true // 当前实际渲染为横屏 (宽 > 高)
+		}
+
+		// 2. 获取硬件的物理像素宽高
+		pw, ph, errPhys := d.GetPhysicalSize()
+		if errPhys == nil {
+			// 🌟【核心修复】：根据实际横竖屏，动态调整物理宽高的长短边
+			if isLandscape && pw < ph {
+				// 当前是横屏，但物理分辨率返回了竖屏（如 720x1520），强制调换为 (1520x720)
+				pw, ph = ph, pw
+			} else if !isLandscape && pw > ph {
+				// 当前是竖屏，但物理分辨率返回了横屏（如 2560x1080），强制调换为 (1080x2560)
+				pw, ph = ph, pw
+			}
+
 			targetX = x * float64(pw)
 			targetY = y * float64(ph)
-			// log.Printf("[Click] 物理还原: (%f, %f) * (%d, %d) = (%d, %d)", x, y, pw, ph, int(targetX), int(targetY))
+			// log.Printf("[Click] 状态: 横屏=%v, 物理换算: (%.3f, %.3f) * (%d, %d) = (%d, %d)", isLandscape, x, y, pw, ph, int(targetX), int(targetY))
 		}
 	}
 
-	// 👉 核心：使用 FastClick (adb shell input tap)
-	// 因为 input tap 接收的是物理坐标系，和截图完全匹配
+	// 👉 核心：使用 FastClick (adb shell input tap) 接收绝对物理坐标
 	err := d.FastClick(int(targetX), int(targetY))
-	
+
 	d.operationDelayAfter("click")
 	return err
 }
