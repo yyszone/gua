@@ -176,6 +176,11 @@ func (d *Device) StartUiautomator() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	// 🌟 补充这一行：如果是 DirectDevice，重启前确保 adb forward 规则健在
+	if dd, ok := d.dev.(*DirectDevice); ok {
+		_ = adb.ForwardPort(d.addr, d.serial, dd.LocalPort, d.serverPort)
+	}
+
 	// 检查服务是否已经在运行
 	if d.checkAlive() {
 		return nil
@@ -303,29 +308,61 @@ func (d *Device) waitReady(timeout time.Duration) error {
 
 // ---------- JSON-RPC 调用 ----------
 
-// jsonrpcCall 发送 JSON-RPC 调用，失败时自动重启 UIAutomator2 并重试
-func (d *Device) jsonrpcCall(method string, params interface{}, timeout float64) (json.RawMessage, error) {
-    ctx := context.Background()
-
-    // t0 := time.Now()
-    result, err := JsonRpcCall(ctx, d.dev, d.serverPort, method, params, timeout, d.debug)
-    // log.Printf("[RPC] %s 耗时=%v err=%v", method, time.Since(t0), err)
-
-    if err != nil {
-        var uaErr *UiAutomationNotConnectedError
-        var httpErr *HTTPError
-        if errors.As(err, &uaErr) || errors.As(err, &httpErr) {
-            log.Printf("UIAutomator2 服务异常，正在重启: %v", err)
-            d.StopUiautomator()
-            if startErr := d.StartUiautomator(); startErr != nil {
-                return nil, startErr
-            }
-            return JsonRpcCall(ctx, d.dev, d.serverPort, method, params, timeout, d.debug)
-        }
-        return nil, err
-    }
-    return result, nil
+// shouldRestartUiautomator 判定是否需要拉起驱动自愈
+func shouldRestartUiautomator(err error) bool {
+	if err == nil {
+		return false
+	}
+	var uaErr *UiAutomationNotConnectedError
+	var httpErr *HTTPError
+	if errors.As(err, &uaErr) || errors.As(err, &httpErr) {
+		return true
+	}
+	// 补全底层 request.go 抛出的错误类型及常见 socket 断开提示
+	if errors.Is(err, ErrHTTPFailed) || errors.Is(err, ErrHTTPTimeout) {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "dial tcp") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "reset by peer") ||
+		strings.Contains(errStr, "eof")
 }
+
+// jsonrpcCall 发送 JSON-RPC 调用，失败时自动重启 UIAutomator2 并原地重试
+func (d *Device) jsonrpcCall(method string, params interface{}, timeout float64) (json.RawMessage, error) {
+	ctx := context.Background()
+
+	result, err := JsonRpcCall(ctx, d.dev, d.serverPort, method, params, timeout, d.debug)
+
+	if err != nil {
+		// 🌟 核心改进：只要遇到连接拒绝或网络断开，自动自愈重试
+		if shouldRestartUiautomator(err) {
+			log.Printf("⚠️ [Gua底层自愈] 检测到 U2 驱动断开或被系统杀掉(%v)，正在自动重启并重试...", err)
+			d.StopUiautomator()
+
+			// 清理残留的旧空闲 TCP 连接
+			switch td := d.dev.(type) {
+			case *DirectDevice:
+				td.Close()
+			case *AdbTunnelDevice:
+				td.Close()
+			}
+
+			if startErr := d.StartUiautomator(); startErr != nil {
+				return nil, fmt.Errorf("UIAutomator2 自动拉活失败: %w (原错误: %v)", startErr, err)
+			}
+
+			// 重启完成后，原地重新执行本次调用！
+			log.Printf("✨ [Gua底层自愈] U2 驱动重启就绪，原地重试本次 %s 操作...", method)
+			return JsonRpcCall(ctx, d.dev, d.serverPort, method, params, timeout, d.debug)
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
 // JsonRpc 返回 JSON-RPC 调用包装器
 func (d *Device) JsonRpc() *JsonRpcWrapper {
 	return d.jsonrpc
