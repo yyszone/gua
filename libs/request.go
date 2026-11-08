@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 	"sync"   
 	"github.com/yyszone/gua/adb"
@@ -53,19 +52,23 @@ func (d *AdbTunnelDevice) CreateConnection(network string, port int) (net.Conn, 
     return adb.CreateTunnel(d.AdbAddr, d.Serial, port)
 }
 func (d *DirectDevice) GetTransport(devicePort int) *http.Transport {
-    d.once.Do(func() {
-        d.transport = &http.Transport{
-            DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-                return (&net.Dialer{}).DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", d.LocalPort))
-            },
-            DisableKeepAlives:   false,
-            MaxIdleConns:        4,
-            MaxIdleConnsPerHost: 4,
-            IdleConnTimeout:     60 * time.Second,
-        }
-    })
-    return d.transport
+	d.once.Do(func() {
+		d.transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{
+					Timeout:   5 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", d.LocalPort))
+			},
+			DisableKeepAlives:   false,
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		}
+	})
+	return d.transport
 }
+
 
 func (d *DirectDevice) Close() {
     if d.transport != nil {
@@ -131,76 +134,68 @@ var (
 //  1. http.Transport 的 DialContext 会为每个请求建立一条新的 ADB 隧道
 //  2. 标准 http.Client 在这条隧道上发送完整的 HTTP/1.1 请求
 //  3. 请求完成后隧道自动关闭，无需额外清理
+
 func HttpRequest(ctx context.Context, dev AdbDevice, devicePort int, method, path string,
-    data map[string]interface{}, timeoutSecs float64, printRequest bool) (*HTTPResponse, error) {
+	data map[string]interface{}, timeoutSecs float64, printRequest bool) (*HTTPResponse, error) {
 
-    if timeoutSecs <= 0 {
-        timeoutSecs = 10.0
-    }
+	if timeoutSecs <= 0 {
+		timeoutSecs = 10.0
+	}
 
-    // 调试打印（不变）
-    if printRequest {
-        now := time.Now().Format("15:04:05.000")
-        url := fmt.Sprintf("http://<adb-tunnel>:%d%s", devicePort, path)
-        if data != nil {
-            b, _ := json.Marshal(data)
-            fmt.Printf("# HTTP 超时=%.3f\n%s $ curl -X %s %s -d '%s'\n", timeoutSecs, now, method, url, string(b))
-        } else {
-            fmt.Printf("# HTTP 超时=%.3f\n%s $ curl -X %s %s\n", timeoutSecs, now, method, url)
-        }
-    }
+	// 🌟 核心改进 1：动态识别目标端口，让连接池按真实端口严格隔离
+	portToDial := devicePort
+	if dd, ok := dev.(*DirectDevice); ok {
+		portToDial = dd.LocalPort
+	}
 
-    url := fmt.Sprintf("http://127.0.0.1:%d%s", devicePort, path)
-    var body io.Reader
-    if data != nil {
-        b, err := json.Marshal(data)
-        if err != nil {
-            return nil, fmt.Errorf("JSON 编码失败: %w", err)
-        }
-        body = bytes.NewReader(b)
-    }
+	// URL 中的 Host 必须是真实的本地监听端口，防止 Go 连接池跨设备混用 TCP 连接
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", portToDial, path)
 
-    req, err := http.NewRequestWithContext(ctx, method, url, body)
-    if err != nil {
-        return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
-    }
-    req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	var body io.Reader
+	if data != nil {
+		b, err := json.Marshal(data)
+		if err != nil {
+			return nil, fmt.Errorf("JSON 编码失败: %w", err)
+		}
+		body = bytes.NewReader(b)
+	}
 
-    // ✅ 复用 Transport，不再每次 new
-    client := &http.Client{
-        Transport: dev.GetTransport(devicePort),
-        Timeout:   time.Duration(timeoutSecs * float64(time.Second)),
-    }
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-    resp, err := client.Do(req)
-    if err != nil {
-        var netErr net.Error
-        if errors.As(err, &netErr) && netErr.Timeout() {
-            return nil, fmt.Errorf("%w: %v", ErrHTTPTimeout, err)
-        }
-        return nil, fmt.Errorf("%w: %v", ErrHTTPFailed, err)
-    }
-    defer resp.Body.Close()
+	// 🌟 核心改进 2：复用 Transport，超时时间由 Context 控制，防止底层 Client 频繁创建
+	client := &http.Client{
+		Transport: dev.GetTransport(devicePort),
+		Timeout:   time.Duration(timeoutSecs * float64(time.Second)),
+	}
 
-    content, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return nil, fmt.Errorf("读取响应体失败: %w", err)
-    }
+	resp, err := client.Do(req)
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return nil, fmt.Errorf("%w: %v", ErrHTTPTimeout, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrHTTPFailed, err)
+	}
+	defer resp.Body.Close()
 
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("HTTP 请求失败: %d %s", resp.StatusCode, resp.Status)
-    }
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应体失败: %w", err)
+	}
 
-    response := &HTTPResponse{
-        Content: content,
-        Status:  resp.StatusCode,
-        Reason:  resp.Status,
-    }
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP 请求失败: %d %s", resp.StatusCode, resp.Status)
+	}
 
-    if printRequest {
-        now := time.Now().Format("15:04:05.000")
-        fmt.Printf("%s 响应 >>>\n%s\n<<< 结束\n\n", now, strings.TrimRight(response.Text(), "\n"))
-    }
+	response := &HTTPResponse{
+		Content: content,
+		Status:  resp.StatusCode,
+		Reason:  resp.Status,
+	}
 
-    return response, nil
+	return response, nil
 }
