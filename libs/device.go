@@ -935,9 +935,9 @@ type P = map[string]interface{}
 // packageName: 包名
 // activity: Activity 名称（可选）
 // stop: 是否先停止应用
+// AppStart 启动应用（彻底修复 monkey 导致方向锁定被关闭的问题）
 func (d *Device) AppStart(packageName string, activity string, stop bool) error {
-	// 1. 👉 启动前预检：使用 pm path 判断包是否存在
-	// 这是 Android 最底层的命令，比 AppCurrent 快且稳
+	// 1. 启动前预检：判断包是否存在
 	resPath, err := d.Shell("pm", "path", packageName)
 	if err != nil || !strings.Contains(resPath.Output, "package:") {
 		return fmt.Errorf("设备未安装应用: %s", packageName)
@@ -948,10 +948,23 @@ func (d *Device) AppStart(packageName string, activity string, stop bool) error 
 	}
 
 	var res *ShellResponse
+
 	if activity == "" {
-		// 使用 monkey 命令启动，并接住输出结果
-		res, err = d.Shell("monkey", "-p", packageName, "-c",
-			"android.intent.category.LAUNCHER", "1")
+		// 🌟 核心改进 1：优先通过 cmd package 或 pm resolve-activity 获取主 Activity
+		// 彻底避开 monkey，完全不会触发方向锁定被关闭的系统副作用！
+		mainAct := d.resolveMainActivity(packageName)
+		if mainAct != "" {
+			args := []string{
+				"am", "start",
+				"-a", "android.intent.action.MAIN",
+				"-c", "android.intent.category.LAUNCHER",
+				"-n", fmt.Sprintf("%s/%s", packageName, mainAct),
+			}
+			res, err = d.Shell(args...)
+		} else {
+			// 兜底方案：如果极端情况没解析出 Activity，才走 monkey
+			res, err = d.Shell("monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "1")
+		}
 	} else {
 		args := []string{
 			"am", "start",
@@ -962,22 +975,53 @@ func (d *Device) AppStart(packageName string, activity string, stop bool) error 
 		res, err = d.Shell(args...)
 	}
 
-	// 2. 👉 处理 ADB 连接层面的错误
 	if err != nil {
-		return err 
+		return err
 	}
 
-	// 3. 👉 关键：解析 Shell 命令的打印输出
-	// 即使命令退出码是 0，如果输出包含以下关键字，也代表启动失败
 	output := res.Output
-	if strings.Contains(output, "Error") || 
-	   strings.Contains(output, "does not exist") || 
-	   strings.Contains(output, "monkey aborted") {
+	if strings.Contains(output, "Error") ||
+		strings.Contains(output, "does not exist") ||
+		strings.Contains(output, "monkey aborted") {
 		return fmt.Errorf("启动失败详情: %s", strings.TrimSpace(output))
 	}
 
+	// 🌟 核心改进 2：主动恢复并固定【方向锁定】为竖屏（0代表竖屏锁定，关闭自动旋转）
+	// accelerometer_rotation=0 代表开启方向锁定（禁止自动旋转）
+	// user_rotation=0 代表锁定为正常竖屏
+	go func() {
+		_, _ = d.Shell("settings put system accelerometer_rotation 0 && settings put system user_rotation 0")
+	}()
+
 	return nil
 }
+// resolveMainActivity 辅助函数：免 monkey 高速解析主 Activity
+func (d *Device) resolveMainActivity(pkg string) string {
+	// 通道 1：Android 7.0+ 最快的 cmd package 解析
+	out, err := d.Shell(fmt.Sprintf("cmd package resolve-activity --brief %s | tail -n 1", pkg))
+	if err == nil {
+		text := strings.TrimSpace(out.Output)
+		if strings.Contains(text, "/") {
+			parts := strings.Split(text, "/")
+			if len(parts) == 2 && parts[1] != "" {
+				return parts[1]
+			}
+		}
+	}
+
+	// 通道 2：传统 dumpsys 兜底解析
+	outDump, err := d.Shell(fmt.Sprintf("dumpsys package %s", pkg))
+	if err == nil {
+		re := regexp.MustCompile(regexp.QuoteMeta(pkg) + `/([a-zA-Z0-9._]+)\s+filter`)
+		m := re.FindStringSubmatch(outDump.Output)
+		if len(m) > 1 {
+			return m[1]
+		}
+	}
+
+	return ""
+}
+
 // AppStop 停止应用
 func (d *Device) AppStop(packageName string) error {
 	_, err := d.Shell("am", "force-stop", packageName)
