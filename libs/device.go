@@ -50,6 +50,7 @@ type Device struct {
 	infoCache     map[string]interface{}
     infoCacheTime time.Time
     infoCacheMu   sync.RWMutex
+	 noRawScreenshot bool // 标记服务端是否不支持 /screenshot 路由
 }
 
 // NewDevice 创建一个新的 Device 客户端并启动 UIAutomator2 服务
@@ -690,17 +691,22 @@ func (d *Device) ScreenOff() error {
 }
 
 // Screenshot 原生二进制流极速截屏（消除 Base64 与 JSON 内存暴涨）
+// Screenshot 截取屏幕截图
 func (d *Device) Screenshot() ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
+	// 🌟 1. 如果此前已经确认服务端支持 /screenshot，或者从未探测过，优先走原生二进制流
+	if !d.noRawScreenshot {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		resp, err := HttpRequest(ctx, d.dev, d.serverPort, "GET", "/screenshot", nil, 8.0, false)
+		cancel()
 
-	// 🌟 1. 优先请求 U2 内部原生的 /screenshot 二进制流接口（零 Base64 开销，极速直通）
-	resp, err := HttpRequest(ctx, d.dev, d.serverPort, "GET", "/screenshot", nil, 8.0, false)
-	if err == nil && len(resp.Content) > 0 {
-		return resp.Content, nil
+		if err == nil && len(resp.Content) > 0 {
+			return resp.Content, nil
+		}
+		// 探测失败（如返回 404），标记该服务不支持，后续截图直接短路走 takeScreenshot，不再吃无效网络延迟
+		d.noRawScreenshot = true
 	}
 
-	// 🌟 2. 备用安全兜底：如果端侧 u2.jar 是极端老版本没有 /screenshot 路由，再走 RPC 降级
+	// 🌟 2. 标准 JSON-RPC takeScreenshot 稳定通道（输出质量 80 的 JPEG）
 	raw, err := d.jsonrpc.Call("takeScreenshot", []interface{}{1, 80})
 	if err != nil {
 		return nil, err
