@@ -4,7 +4,7 @@
 
 # Gua (Go Mobile UIAutomator)
 
-`Gua` 是一个基于纯 Go 语言实现的 Android UI 自动化库。它参考了 Python `uiautomator2` 的连接架构，通过 **ADB 隧道协议** 直接与设备通信，无需 `adb forward`，不占用本地端口，具备极高的稳定性和并发支持能力。
+`Gua` 是一个基于纯 Go 语言实现的 Android UI 自动化库。它参考了 Python `uiautomator2` 的连接架构，通过纯 Go ADB 客户端与设备通信，默认尝试动态本地端口转发；转发不可用时自动回退到 ADB 隧道模式，避免依赖固定端口并降低端口冲突。
 
 ## ✨ 功能特性
 
@@ -14,6 +14,7 @@
     - **Selector**: 支持 Text, ID, Class, Description 等正则/精确匹配。
     - **XPath**: 支持标准 XPath 1.0 语法，轻松处理复杂层级。
     - **OCR**: 集成 Tesseract OCR，支持图像文字识别与坐标定位。
+    - **图像模板找图**：基于 SAD 相似度匹配，支持透明 PNG、多模板优先级、同屏多目标查找和模板缓存，无需 OCR。
 - **🖱️ 深度交互**：支持点击、长按、双击、多点滑动、拖拽、快速操作 (FastClick)。
 - **⌨️ 输入法集成**：内置 AdbKeyboard，完美支持中文输入和特殊动作 (Done/Search)。
 - **🛡️ 智能监控**：Watcher 机制自动拦截系统权限弹窗、广告、升级提示。
@@ -36,7 +37,10 @@ go get github.com/yyszone/gua
 import "github.com/yyszone/gua/libs"
 
 // 连接设备并自动初始化服务（推送 jar/apk、启动服务）
-d, err := libs.NewDevice("emulator-5554") 
+d, err := libs.NewDevice("emulator-5554")
+if err != nil {
+    log.Fatal(err)
+}
 defer d.Close()
 
 // 如果服务已在运行，可跳过初始化步骤
@@ -81,6 +85,111 @@ for _, r := range res.Regions {
 }
 ```
 
+#### D. 图像模板找图（Image Matching）
+
+Gua 内置图像模板匹配功能，可以直接在设备截图中查找按钮、图标、图片或其他视觉元素。它不依赖 Tesseract OCR，适合文字识别不稳定、控件没有可用 `resourceId`，或者需要按图标定位的场景。
+
+**1）准备模板图片**
+
+默认模板目录是程序当前工作目录下的 `find_pic`，支持 PNG、JPG、JPEG 和 GIF（GIF 使用解码后的首帧）。文件名按前缀匹配，同一个前缀可以放多张不同分辨率或状态的模板变体。
+
+```text
+find_pic/
+├── login.png
+├── confirm.jpg
+└── 应用宝/
+    └── 应用宝_领积分.png
+```
+
+当模板名称包含下划线，且 `find_pic` 下存在以下划线前半部分命名的子目录时，Gua 会优先在该子目录中查找。例如 `应用宝_领积分` 会优先查找 `find_pic/应用宝/` 中以 `应用宝_领积分` 开头的图片文件。
+
+建议模板图片从目标设备的实际截图中裁剪，尽量保持相同分辨率、缩放比例、主题和显示状态。不同分辨率可以为同一个前缀准备多张模板变体。
+
+**2）查找单个模板**
+
+```go
+// 查找 login.png，阈值 0.85，返回像素坐标。
+// 最后一个参数 1 表示只截屏匹配一次。
+x, y, index := d.FindImage("login", 0.85, false, 1)
+if index != -1 {
+    fmt.Printf("找到 login，中心坐标：(%.0f, %.0f)\n", x, y)
+    _ = d.Click(x, y)
+}
+```
+
+**3）按优先级查找多个模板**
+
+```go
+images := []string{"login", "confirm", "close"}
+
+// 按 images 的顺序确定优先级。
+// 如果 login 和 confirm 都命中，优先返回 login。
+x, y, index := d.FindImage(images, 0.85, false, 1)
+if index >= 0 {
+    fmt.Printf("命中模板：%s，坐标：(%.0f, %.0f)\n", images[index], x, y)
+    _ = d.Click(x, y)
+}
+```
+
+`FindImage` 参数说明：
+
+- `targetNames`：模板名称字符串，或按优先级排列的 `[]string`。
+- `threshold`：相似度阈值，范围为 `0.0~1.0`，例如 `0.90`。
+- `usePerc`：`false` 返回像素坐标；`true` 返回屏幕宽高比例坐标（0~1）。
+- `maxRetry`：可选重试次数；不传或传入非正数时默认重试 30 次。
+
+返回值是匹配区域中心点的 `x`、`y` 和命中模板在 `targetNames` 中的索引。未找到时返回 `(-1, -1, -1)`。
+
+**4）查找同一模板的所有位置**
+
+例如一个页面上有多个相同图标，可以一次性找出全部位置：
+
+```go
+// usePerc=true，返回 0~1 的比例坐标。
+// maxResults=0 表示不限制结果数量。
+points, err := d.FindImageMulti("应用宝_领积分", 0.93, true, 0)
+if err != nil {
+    log.Printf("找图失败：%v", err)
+    return
+}
+
+for _, p := range points {
+    fmt.Printf("找到坐标：x=%.4f, y=%.4f, score=%.3f\n", p.X, p.Y, p.Score)
+    // Device.Click 支持比例坐标，可以直接传入。
+    _ = d.Click(p.X, p.Y)
+    time.Sleep(100 * time.Millisecond)
+}
+```
+
+`FindImageMulti` 参数说明：
+
+- `targetName`：模板文件名前缀；同名前缀的图片变体都会参与匹配。
+- `threshold`：相似度阈值，范围为 `0.0~1.0`。
+- `usePerc`：是否返回屏幕比例坐标。
+- `maxResults`：最多返回多少个结果，`<=0` 表示不限制。
+- `maxRetry`：可选重试次数；不传或传入非正数时默认重试 1 次。
+
+返回的 `libs.MatchPoint` 包含 `X`、`Y` 和 `Score`。结果按屏幕从上到下、从左到右排列；不同模板变体命中的同一位置会进行去重。没有找到匹配时返回空切片和 `nil`；模板目录、图片解码或截图发生错误时会返回错误。
+
+**5）修改模板目录和管理缓存**
+
+默认使用当前工作目录下的 `find_pic`。也可以在程序启动时自定义目录：
+
+```go
+// 相对路径以程序当前工作目录为基准；也可以传入绝对路径。
+if err := libs.SetImageTemplateDir("./assets/my_templates"); err != nil {
+    log.Fatal(err)
+}
+
+fmt.Println("当前模板目录：", libs.GetImageTemplateDir())
+```
+
+模板图片缓存会根据文件大小和修改时间自动刷新。目录文件列表缓存时间为 30 秒；新增或删除模板后，如果希望立即刷新，可以调用：
+
+```go
+libs.ClearImageTemplateCache()
+```
+
 ### 3. UI 操作交互
 
 #### 点击与手势
@@ -115,7 +224,7 @@ im.SendAction("search")           // 模拟键盘点击“搜索”
 d.AppStart("com.tencent.mm", "", true) // 启动微信，stop=true 表示先强杀
 d.AppStop("com.tencent.mm")            // 停止应用
 d.AppClear("com.tencent.mm")           // 清除数据
-current, _ := d.AppCurrent()           // 获取当前包名和 Activity
+current, _ := d.AppCurrent()            // 获取当前包名和 Activity
 ```
 
 ### 6. 弹窗自动监控 (Watcher)
@@ -149,19 +258,19 @@ fmt.Println(res.Output)
 
 ## 🏗️ 架构参考
 
-### ADB 隧道 (Tunneling)
-本项目连接设备的核心代码位于 `adb/connect.go` 的 `CreateTunnel` 方法。它直接模拟 ADB 协议握手，通过 `host:transport` 路由到设备，随后建立直连 TCP 管道。
-- **优点**：不需要在本地机器开启 9008 端口转发，彻底解决端口冲突和断连后的资源残留问题。
+### ADB 连接与隧道回退
+设备连接代码位于 `adb/`。`NewDevice` 会优先尝试动态分配本地端口并建立 ADB 转发；转发失败时自动回退到 `CreateTunnel`，通过 ADB 协议握手和 `host:transport` 建立设备隧道。
+- **优点**：不依赖固定本地端口；转发不可用时仍可使用隧道方式连接设备。
 
 ### UIAutomator2 服务
-通过 `assets/` 下的 `u2.jar` 和 `APK`，在 Android 端开启一个基于 Jetty 的 HTTP 服务，监听 9008 端口。Go 端的所有 UI 操作最终都会转化为 JSON-RPC 2.0 请求发送给设备。
+通过 `assets/` 下的 `u2.jar` 和 APK，在 Android 端开启一个基于 Jetty 的 HTTP 服务，监听 9008 端口。Go 端的所有 UI 操作最终都会转化为 JSON-RPC 2.0 请求发送给设备。
 
 ---
 
 ## 📂 目录结构说明
 
 - `adb/`: 基础 ADB 协议实现（连接、读取状态、文件同步、隧道构建）。
-- `libs/`: 核心业务逻辑（设备类、元素类、XPath 引擎、OCR、输入法、监控器）。
+- `libs/`: 核心业务逻辑（设备类、元素类、XPath 引擎、OCR、图像模板匹配、输入法、监控器）。
 - `services/`: 服务部署逻辑（检查环境、安装 jar 和 apk）。
 - `assets/`: 静态资源文件（由 `go:embed` 引入）。
 - `cmd/`: 演示 Demo 样例。
@@ -177,4 +286,3 @@ fmt.Println(res.Output)
 ## 📜 许可证
 
 本项目采用 **MIT** 许可证开源。
-
